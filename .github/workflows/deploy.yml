@@ -1,0 +1,155 @@
+name: Generate Images & Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      hero_prompt:
+        description: 'Промпт для Hero картинки'
+        required: false
+        default: 'Professional female marketing expert, dark midnight blue background, golden bokeh light particles, cinematic lighting, premium editorial style, 8k'
+      bg_prompt:
+        description: 'Промпт для фона секции'
+        required: false
+        default: 'Abstract dark luxury background, deep navy #0D0D14, golden glowing neural network lines, minimal geometric patterns, premium feel'
+
+jobs:
+  generate-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Generate Hero Image via kie.ai
+        id: hero_image
+        env:
+          KIE_API_KEY: ${{ secrets.KIE_API_KEY }}
+        run: |
+          echo "🎨 Генерирую Hero картинку через Nano Banana..."
+          
+          PROMPT="${{ github.event.inputs.hero_prompt || 'Professional female marketing expert, dark midnight blue background, golden bokeh light particles, cinematic lighting, premium editorial style, 8k' }}"
+          
+          # Создаём задачу генерации
+          RESPONSE=$(curl -s -X POST "https://api.kie.ai/api/v1/jobs/createTask" \
+            -H "Authorization: Bearer $KIE_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"model\": \"nano-banana-2\",
+              \"input\": {
+                \"prompt\": \"$PROMPT\",
+                \"aspect_ratio\": \"3:4\"
+              }
+            }")
+          
+          echo "Response: $RESPONSE"
+          TASK_ID=$(echo $RESPONSE | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('data',{}).get('taskId',''))" 2>/dev/null || echo "")
+          echo "Task ID: $TASK_ID"
+          echo "task_id=$TASK_ID" >> $GITHUB_OUTPUT
+
+      - name: Wait for Hero Image
+        id: hero_result
+        env:
+          KIE_API_KEY: ${{ secrets.KIE_API_KEY }}
+        run: |
+          TASK_ID="${{ steps.hero_image.outputs.task_id }}"
+          
+          if [ -z "$TASK_ID" ]; then
+            echo "⚠️ Task ID пустой, пропускаем"
+            echo "image_url=" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          echo "⏳ Ждём генерацию (до 2 минут)..."
+          
+          for i in {1..24}; do
+            sleep 5
+            RESULT=$(curl -s "https://api.kie.ai/api/v1/jobs/queryTask?taskId=$TASK_ID" \
+              -H "Authorization: Bearer $KIE_API_KEY")
+            
+            STATUS=$(echo $RESULT | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('data',{}).get('successFlag',''))" 2>/dev/null || echo "")
+            echo "Попытка $i, статус: $STATUS"
+            
+            if [ "$STATUS" = "1" ]; then
+              IMAGE_URL=$(echo $RESULT | python3 -c "
+          import sys,json
+          d=json.load(sys.stdin)
+          urls = d.get('data',{}).get('response',{}).get('result_urls',[])
+          print(urls[0] if urls else '')
+          " 2>/dev/null || echo "")
+              echo "✅ Картинка готова: $IMAGE_URL"
+              echo "image_url=$IMAGE_URL" >> $GITHUB_OUTPUT
+              break
+            fi
+          done
+
+      - name: Inject Image into HTML
+        run: |
+          IMAGE_URL="${{ steps.hero_result.outputs.image_url }}"
+          
+          if [ -z "$IMAGE_URL" ]; then
+            echo "⚠️ Картинка не сгенерировалась, используем CSS фон"
+            exit 0
+          fi
+          
+          echo "🖼️ Вставляю картинку в HTML..."
+          
+          # Заменяем плейсхолдер фото в HTML
+          if [ -f "index.html" ]; then
+            python3 -c "
+          import re
+          with open('index.html', 'r', encoding='utf-8') as f:
+              content = f.read()
+
+          # Заменяем placeholder на реальное фото
+          old = '''<div class=\"hero-photo-frame\" style=\"background:#1A1A2A;display:flex;align-items:center;justify-content:center;\">
+                <!-- Replace this div with: <img src=\"YOUR_PHOTO.jpg\" alt=\"Виктория Шет\"> -->
+                <div style=\"text-align:center;padding:3rem\">
+                  <div style=\"font-family:var(--font-serif);font-size:5rem;font-weight:300;color:var(--faint);line-height:1;margin-bottom:1rem\">VS</div>
+                  <div style=\"font-size:.72rem;font-weight:500;letter-spacing:.18em;text-transform:uppercase;color:var(--faint)\">Вставьте вашу фотографию</div>
+                </div>
+                <div class=\"hero-photo-overlay\"></div>
+                <div class=\"hero-photo-glow\"></div>
+              </div>'''
+
+          new = '''<div class=\"hero-photo-frame\">
+                <img src=\"$IMAGE_URL\" alt=\"Виктория Шет\" style=\"width:100%;height:100%;object-fit:cover\">
+                <div class=\"hero-photo-overlay\"></div>
+                <div class=\"hero-photo-glow\"></div>
+              </div>'''
+
+          if old in content:
+              content = content.replace(old, new)
+              print('✅ Плейсхолдер заменён на реальное фото')
+          else:
+              print('⚠️ Плейсхолдер не найден, возможно уже заменён')
+
+          with open('index.html', 'w', encoding='utf-8') as f:
+              f.write(content)
+          " 
+          fi
+
+      - name: Commit updated HTML
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add -A
+          git diff --staged --quiet || git commit -m "🤖 Auto: injected AI-generated images"
+          git push
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./
+          publish_branch: gh-pages
